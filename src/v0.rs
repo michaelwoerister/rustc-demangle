@@ -34,7 +34,7 @@ pub enum ParseError {
 /// This function will take a **mangled** symbol and return a value. When printed,
 /// the de-mangled version will be written. If the symbol does not look like
 /// a mangled symbol, the original value will be written instead.
-pub fn demangle(s: &str) -> Result<(Demangle, &str), ParseError> {
+pub fn demangle(s: &str) -> Result<(Demangle<'_>, &str), ParseError> {
     // First validate the symbol. If it doesn't look like anything we're
     // expecting, we just print it literally. Note that we must handle non-Rust
     // symbols because we could have any function in the backtrace.
@@ -91,7 +91,7 @@ pub fn demangle(s: &str) -> Result<(Demangle, &str), ParseError> {
 }
 
 impl<'s> fmt::Display for Demangle<'s> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut printer = Printer {
             parser: Ok(Parser {
                 sym: self.inner,
@@ -238,7 +238,7 @@ impl<'s> Ident<'s> {
 }
 
 impl<'s> fmt::Display for Ident<'s> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.try_small_punycode_decode(|chars| {
             for &c in chars {
                 c.fmt(f)?;
@@ -563,9 +563,57 @@ impl<'s> Parser<'s> {
             })
         }
     }
+
+    /// Looks for the `C<digits>_` prefix that marks a skippable section.
+    fn peek_skippable_prefix(&self) -> Option<SkippableSection> {
+        let bytes = self.sym.as_bytes();
+        let mut index = self.next;
+
+        if bytes.get(index).cloned() != Some(b'C') {
+            return None;
+        }
+
+        index += 1;
+
+        let length_digits_start = index;
+
+        while bytes.get(index).map_or(false, u8::is_ascii_digit) {
+            index += 1;
+        }
+
+        let length_digits_end = index;
+
+        if length_digits_start == length_digits_end {
+            // No digits found, this also covers the case where we have
+            // a normal crate production with disambiguator `Cs<hash><digits><ident>`
+            return None;
+        }
+
+        if length_digits_end >= bytes.len() {
+            // We are at the end of the input, this is probably not a well-formed
+            // symbol name.
+            return None;
+        }
+
+        if bytes[length_digits_end] != b'_' {
+            // This is another kind of special `C` production, like `C3f16`
+            return None;
+        }
+
+        // Convert the digits to an int
+        let mut num_bytes = 0;
+        for &c in &bytes[length_digits_start..length_digits_end] {
+            num_bytes = num_bytes * 10 + (c - b'0') as usize;
+        }
+
+        Some(SkippableSection {
+            content_start: length_digits_end + 1, // +1 to skip the `_` too
+            section_end: length_digits_end + num_bytes,
+        })
+    }
 }
 
-struct Printer<'a, 'b: 'a, 's> {
+struct Printer<'a, 'b, 's> {
     /// The input parser to demangle from, or `Err` if any (parse) error was
     /// encountered (in order to disallow further likely-incorrect demangling).
     ///
@@ -661,6 +709,8 @@ impl<'a, 'b, 's> Printer<'a, 'b, 's> {
             return Ok(());
         }
 
+        // TODO: Keep going even if parsing the referenced section failed, so
+        //       that we can handle backrefs into skippable sections.
         let orig_parser = mem::replace(&mut self.parser, Ok(backref_parser));
         let r = f(self);
         self.parser = orig_parser;
@@ -889,14 +939,16 @@ impl<'a, 'b, 's> Printer<'a, 'b, 's> {
     }
 
     fn print_generic_arg(&mut self) -> fmt::Result {
-        if self.eat(b'L') {
-            let lt = parse!(self, integer_62);
-            self.print_lifetime_from_index(lt)
-        } else if self.eat(b'K') {
-            self.print_const(false)
-        } else {
-            self.print_type()
-        }
+        self.print_with_fallback(|this| {
+            if this.eat(b'L') {
+                let lt = parse!(this, integer_62);
+                this.print_lifetime_from_index(lt)
+            } else if this.eat(b'K') {
+                this.print_const(false)
+            } else {
+                this.print_type()
+            }
+        })
     }
 
     fn print_type(&mut self) -> fmt::Result {
@@ -1081,7 +1133,6 @@ impl<'a, 'b, 's> Printer<'a, 'b, 's> {
 
     fn print_const(&mut self, in_value: bool) -> fmt::Result {
         let tag = parse!(self, next);
-
         parse!(self, push_depth);
 
         // Only literals (and the names of `const` generic parameters, but they
@@ -1237,11 +1288,75 @@ impl<'a, 'b, 's> Printer<'a, 'b, 's> {
             None => invalid!(self),
         }
     }
+
+    fn print_with_fallback(&mut self, mut f: impl FnMut(&mut Self) -> fmt::Result) -> fmt::Result {
+        let skippable_section = self
+            .parser
+            .as_ref()
+            .map(Parser::peek_skippable_prefix)
+            .unwrap_or_default();
+
+        if let Some(skippable_section) = skippable_section {
+            // If we got here, we know have a valid parser and can unwrap.
+            let self_parser = self.parser.as_mut().unwrap();
+
+            // Create a look-ahead printer to check if we can handle the skippable
+            // section without error.
+            let mut look_ahead = Printer {
+                bound_lifetime_depth: self.bound_lifetime_depth,
+                out: None, // Don't produce any output
+                parser: Ok(Parser {
+                    depth: self_parser.depth,
+                    sym: &self_parser.sym[..skippable_section.section_end],
+                    next: skippable_section.content_start,
+                }),
+            };
+
+            // Do the look-ahead parsing. We ignore the result, which is unreliable,
+            // and instead check if the parser still Ok after the parsing
+            let _ = f(&mut look_ahead);
+
+            if look_ahead.parser.is_ok() {
+                // We succeeded, so we eat the skippable section prefix and do the
+                // printing for real.
+                self_parser.next = skippable_section.content_start;
+                f(self)
+            } else {
+                // Parsing failed so we emit the contents of the skippable section verbatim.
+                self_parser.next = skippable_section.section_end;
+                let verbatim = &self_parser.sym
+                    [skippable_section.content_start..skippable_section.section_end];
+
+                self.print("{{{ skipped: ")?;
+                self.print(verbatim)?;
+                self.print(" }}}")?;
+                Ok(())
+            }
+        } else {
+            f(self)
+        }
+    }
+}
+
+/// A skippable section in a mangled name looks like `C<digits>_<content>`,
+/// where <digits> is an ASCII decimal designating the number of bytes in
+/// `<content>` plus one byte for the `_`.
+/// The `section_end` field is the index in the input array right after the
+/// end of `<content>`. The `content_start` field is the index at the first
+/// byte of `<content>`.
+#[derive(Debug, PartialEq, Eq)]
+struct SkippableSection {
+    section_end: usize,
+    content_start: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use std::prelude::v1::*;
+
+    use crate::v0::SkippableSection;
+
+    use super::Parser;
 
     macro_rules! t {
         ($a:expr, $b:expr) => {{
@@ -1278,7 +1393,7 @@ mod tests {
 
     #[test]
     fn demangle_crate_with_leading_digit() {
-        t_nohash!("_RNvC6_123foo3bar", "123foo::bar");
+        t_nohash!("_RNvCs_6_123foo3bar", "123foo::bar");
     }
 
     #[test]
@@ -1532,5 +1647,46 @@ mod tests {
         sym.push('E');
 
         assert_contains!(::demangle(&sym).to_string(), "{recursion limit reached}");
+    }
+
+    #[test]
+    fn demangle_const_skippable() {
+        // Parsable
+        t_nohash!(
+            "_RINtCsHASH_7mycrate3FooxC11_KRe616263_E",
+            r#"mycrate::Foo::<i64, "abc">"#
+        );
+
+        // Not Parsable
+        t_nohash!(
+            "_RINtCsHASH_7mycrate3FooxC8_@$%^&*#E",
+            "mycrate::Foo::<i64, {{{ skipped: @$%^&*# }}}>"
+        );
+    }
+
+    #[test]
+    fn skippable_section_prefix() {
+        macro_rules! test_skippable_prefix {
+            ($txt:expr, $expected:expr) => {{
+                let p = Parser {
+                    depth: 0,
+                    sym: $txt,
+                    next: 0,
+                };
+                let actual = p.peek_skippable_prefix();
+                assert_eq!(actual, $expected);
+            }};
+        }
+
+        test_skippable_prefix!(
+            "C3_xx",
+            Some(SkippableSection {
+                content_start: 3,
+                section_end: 5,
+            })
+        );
+
+        test_skippable_prefix!("Cs1341adsasd_3_xx", None);
+        test_skippable_prefix!("C3f16", None);
     }
 }
