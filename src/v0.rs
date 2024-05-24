@@ -608,7 +608,7 @@ impl<'s> Parser<'s> {
 
         Some(SkippableSection {
             content_start: length_digits_end + 1, // +1 to skip the `_` too
-            section_end: length_digits_end + num_bytes,
+            section_end: length_digits_end + num_bytes + 1,
         })
     }
 }
@@ -1653,13 +1653,13 @@ mod tests {
     fn demangle_const_skippable() {
         // Parsable
         t_nohash!(
-            "_RINtCsHASH_7mycrate3FooxC11_KRe616263_E",
+            "_RINtCsHASH_7mycrate3FooxC10_KRe616263_E",
             r#"mycrate::Foo::<i64, "abc">"#
         );
 
         // Not Parsable
         t_nohash!(
-            "_RINtCsHASH_7mycrate3FooxC8_@$%^&*#E",
+            "_RINtCsHASH_7mycrate3FooxC7_@$%^&*#E",
             "mycrate::Foo::<i64, {{{ skipped: @$%^&*# }}}>"
         );
     }
@@ -1679,14 +1679,14 @@ mod tests {
         }
 
         test_skippable_prefix!(
-            "C3_xx",
+            "C2_xx",
             Some(SkippableSection {
                 content_start: 3,
                 section_end: 5,
             })
         );
 
-        test_skippable_prefix!("Cs1341adsasd_3_xx", None);
+        test_skippable_prefix!("Cs1341adsasd_2_xx", None);
         test_skippable_prefix!("C3f16", None);
     }
 }
